@@ -54,6 +54,8 @@ RZ_LIB_VERSION_HEADER(rz_heap_glibc);
 #define TC_HDR_SZ 0x10
 #define TC_SZ_32  0x0
 #define TC_SZ_64  0x10
+#define HEAP_PAGE_SIZE 0x21000
+#define HEAP_PAGE_SIZE_X86 0x22000
 
 // Introduced with glibc 2.32
 

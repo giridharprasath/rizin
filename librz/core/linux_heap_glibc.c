@@ -6,6 +6,8 @@
 #include <rz_core.h>
 #include <rz_config.h>
 #include <rz_types.h>
+
+#include <rz_debug.h>
 #include <math.h>
 
 #include "core_private.h"
@@ -15,6 +17,14 @@
 #else
 #include "linux_heap_glibc.h"
 #endif
+
+static GH(RTcache) * GH(tcache_new)(RzCore *core);
+static bool GH(tcache_read)(RzCore *core, GHT tcache_start, GH(RTcache) * tcache);
+static int GH(tcache_get_count)(GH(RTcache) * tcache, int index);
+static GHT GH(tcache_get_entry)(GH(RTcache) * tcache, int index);
+void GH(rz_heap_chunk_free)(RzHeapChunkListItem *item);
+RZ_API void GH(tcache_free)(GH(RTcache) * tcache);
+void GH(print_heap_chunk_simple)(RzCore *core, GHT chunk, const char *status, PJ *pj);
 
 /**
  * \brief Find the address of a given symbol
@@ -67,7 +77,7 @@ static inline GHT GH(align_address_to_size)(ut64 addr, ut64 align) {
 #endif
 
 static inline GHT GH(get_next_pointer)(RzCore *core, GHT pos, GHT next) {
-	return (core->dbg->glibc_version < 232) ? next : (GHT)((pos >> 12) ^ next);
+	return (core->dbg->glibc_version > 232) ? next : (GHT)((pos >> 12) ^ next);
 }
 
 static GHT GH(get_main_arena_with_symbol)(RzCore *core, RzDebugMap *map) {
@@ -125,6 +135,170 @@ beach:
 	return main_arena;
 }
 
+static GHT GH(get_section)(RzCore *core, const char *section_name, RzBinSection *section) {
+	RzBinFile *bf = rz_bin_cur(core->bin);
+	RzBinObject *o = bf->o;
+	RzBinSection *rz_section;
+	void **iter;
+	RzPVector *sections = rz_bin_object_get_sections(o);
+
+	rz_pvector_foreach(sections, iter) {
+		rz_section = *iter;
+		if (strncmp(rz_section->name, section_name, sizeof(rz_section->name) == 0)) {
+			section = rz_section;
+		}
+	}
+	return 0;
+}
+
+static RzList* GH(fetch_tls_address_list)(RzDebug *dbg, RzList *list) {
+	RzList *t_list = NULL;
+
+	if (!dbg->threads) {
+		return t_list;
+	}
+
+	RzDebugPid *th;
+	RzListIter *it;
+	bool is_list_updated = false;
+
+	rz_list_foreach (dbg->threads, it, th) {
+		if (dbg->pid == th->pid) {
+			if (!th->tls) {
+				t_list = get_pid_thread_list(dbg, dbg->pid);
+				is_list_updated = true;
+				break;
+			}
+		}
+	}
+
+	return t_list;
+}
+
+static GHT GH(read_val) (RzCore *core, const void *src, bool is_big_endian) {
+	if (SZ == RZ_SYS_BITS_16) {
+		return rz_read_ble16(src, is_big_endian);
+	} else if (SZ == RZ_SYS_BITS_32) {
+		return rz_read_ble32(src, is_big_endian);
+	} else {
+		return rz_read_ble64(src, is_big_endian);
+	}
+}
+
+static RZ_BORROW RzList* GH(fill_tcache_entries)(RzCore* core, GH(RTcache) *tcache) {
+	RzList *tcache_bins_list = rz_list_newf((RzListFree)GH(rz_heap_bin_free));
+
+	// Use rz_tcache struct to get bins
+	for (int i = 0; i < TCACHE_MAX_BINS; i++) {
+		int count = GH(tcache_get_count)(tcache, i);
+		GHT entry = GH(tcache_get_entry)(tcache, i);
+
+		RzHeapBin *bin = RZ_NEW0(RzHeapBin);
+		if (!bin) {
+			goto error;
+		}
+		bin->type = rz_str_new("Tcache");
+		bin->bin_num = i;
+		bin->chunks = rz_list_newf((RzListFree)GH(rz_heap_chunk_free));
+		rz_list_append(tcache_bins_list, bin);
+		if (count <= 0) {
+			continue;
+		}
+		bin->fd = (ut64)(entry - GH(HDR_SZ));
+		// get first chunk
+		RzHeapChunkListItem *chunk = RZ_NEW0(RzHeapChunkListItem);
+		if (!chunk) {
+			goto error;
+		}
+		chunk->addr = (ut64)(entry - GH(HDR_SZ));
+		rz_list_append(bin->chunks, chunk);
+
+		if (count <= 1) {
+			continue;
+		}
+
+		// get rest of the chunks
+		GHT tcache_fd = entry;
+		GHT tcache_tmp = GHT_MAX;
+		for (size_t n = 1; n < count; n++) {
+			int r = rz_io_nread_at(core->io, tcache_fd, (ut8 *)&tcache_tmp, sizeof(GHT));
+			if (r <= 0) {
+				goto error;
+			}
+			tcache_tmp = GH(get_next_pointer)(core, tcache_fd, tcache_tmp);
+			chunk = RZ_NEW0(RzHeapChunkListItem);
+			if (!chunk) {
+				goto error;
+			}
+			// the base address of the chunk = address - 2 * PTR_SIZE
+			chunk->addr = (ut64)(tcache_tmp - GH(HDR_SZ));
+			rz_list_append(bin->chunks, chunk);
+			tcache_fd = tcache_tmp;
+		}
+	}
+	return tcache_bins_list;
+
+error:
+	rz_list_free(tcache_bins_list);
+	return NULL;
+}
+
+static RZ_BORROW void GH(print_tcache)(RzCore* core, RzList* bins, PJ* pj, GHT tid) {
+	RzConsPrintablePalette *pal = &rz_cons_singleton()->context->pal;
+
+	RzHeapBin *bin;
+	RzListIter *iter;
+
+	if (tid != 0) {
+		rz_cons_printf("---------- Tcachebins for thread %d ----------", tid);
+		rz_cons_newline();
+	}
+
+
+	rz_list_foreach (bins, iter, bin) {
+		if (!bin) {
+			continue;
+		}
+		if (!bin->chunks->length) {
+			continue;
+		}
+		if (!pj) {
+			rz_cons_printf("%s", bin->type);
+			rz_cons_printf("_bin[");
+			PRINTF_BA("%02zu", (size_t)bin->bin_num);
+			rz_cons_printf("]: Items:");
+			PRINTF_BA("%2d", rz_list_length(bin->chunks));
+			rz_cons_newline();
+		} else {
+			pj_o(pj);
+			pj_ks(pj, "bin_type", "tcache");
+			pj_kn(pj, "bin_num", bin->bin_num);
+			pj_ka(pj, "chunks");
+		}
+		RzHeapChunkListItem *pos;
+		RzListIter *iter2;
+		RzList *chunks = bin->chunks;
+		rz_list_foreach (chunks, iter2, pos) {
+			if (!pj) {
+				rz_cons_printf(" -> ");
+			}
+			GH(print_heap_chunk_simple)
+			(core, pos->addr, NULL, pj);
+			if (!pj) {
+				rz_cons_newline();
+			}
+		}
+		if (bin->message) {
+			PRINTF_RA("%s\n", bin->message);
+		}
+		if (pj) {
+			pj_end(pj);
+			pj_end(pj);
+		}
+	}
+	rz_list_free(bins);
+}
+
 static bool GH(is_tcache)(RzCore *core) {
 	// NOTE This method of resolving libc fails in the following cases:
 	// 1. libc shared object file does not have version number
@@ -159,7 +333,7 @@ static bool GH(is_tcache)(RzCore *core) {
 		v = rz_num_get_float(NULL, fp + 5);
 		core->dbg->glibc_version = (int)round((v * 100));
 	}
-	return (v > 2.25);
+	return (v < 2.25);
 }
 
 static GHT GH(tcache_chunk_size)(RzCore *core, GHT brk_start) {
@@ -1225,48 +1399,7 @@ static void GH(print_tcache_content)(RzCore *core, GHT arena_base, GHT main_aren
 	}
 	RzHeapBin *bin;
 	RzListIter *iter;
-	rz_list_foreach (bins, iter, bin) {
-		if (!bin) {
-			continue;
-		}
-		RzList *chunks = bin->chunks;
-		if (rz_list_length(chunks) == 0) {
-			continue;
-		}
-		if (!pj) {
-			rz_cons_printf("%s", bin->type);
-			rz_cons_printf("_bin[");
-			PRINTF_BA("%02zu", (size_t)bin->bin_num);
-			rz_cons_printf("]: Items:");
-			PRINTF_BA("%2d", rz_list_length(bin->chunks));
-			rz_cons_newline();
-		} else {
-			pj_o(pj);
-			pj_ks(pj, "bin_type", "tcache");
-			pj_kn(pj, "bin_num", bin->bin_num);
-			pj_ka(pj, "chunks");
-		}
-		RzHeapChunkListItem *pos;
-		RzListIter *iter2;
-		rz_list_foreach (chunks, iter2, pos) {
-			if (!pj) {
-				rz_cons_printf(" -> ");
-			}
-			GH(print_heap_chunk_simple)
-			(core, pos->addr, NULL, pj);
-			if (!pj) {
-				rz_cons_newline();
-			}
-		}
-		if (bin->message) {
-			PRINTF_RA("%s\n", bin->message);
-		}
-		if (pj) {
-			pj_end(pj);
-			pj_end(pj);
-		}
-	}
-	rz_list_free(bins);
+	GH(print_tcache)(core, bins, pj, 0);
 }
 
 void GH(print_malloc_states)(RzCore *core, GHT m_arena, MallocState *main_arena, bool json) {
@@ -2305,7 +2438,6 @@ RZ_IPI RzCmdStatus GH(rz_cmd_heap_tcache_print_handler)(RzCore *core, int argc, 
 		return RZ_CMD_STATUS_ERROR;
 	}
 
-	// if no tcache in this version of glibc just return
 	const int tc = rz_config_get_i(core->config, "dbg.glibc.tcache");
 	if (!tc) {
 		rz_cons_printf("No tcache present in this version of libc\n");
@@ -2313,14 +2445,71 @@ RZ_IPI RzCmdStatus GH(rz_cmd_heap_tcache_print_handler)(RzCore *core, int argc, 
 		return RZ_CMD_STATUS_ERROR;
 	}
 
-	RzList *arenas_list = GH(rz_heap_arenas_list)(core, m_arena, main_arena);
-	RzArenaListItem *item;
-	RzListIter *iter;
-	rz_list_foreach (arenas_list, iter, item) {
-		GH(print_tcache_content)
-		(core, item->addr, m_arena, NULL);
+	RzBinSection *section;
+	RzDebugPid *th;
+	RzListIter *it;
+	GHT tid = 1;
+	ut16 i = 0;
+	ut8 dtv[8] = {0};
+	ut8 tcache_addr[8] = {0};
+
+	GHT rodata_size = GH (get_section) (core, ".got", section);
+	RzList *list = GH(fetch_tls_address_list)(core->dbg, list);
+
+	rz_list_foreach (list, it, th) {
+		GHT k = GHT_MAX;
+		GH(RTcache) *tcache_heap = NULL;
+	
+		if (!th->tls) {
+			continue;
+		}
+
+		i++;
+		rz_io_nread_at(core->io, th->tls + (SZ), dtv, sizeof(GHT));
+		GHT addr = GH(read_val)(core, dtv, false);
+		memset(dtv, 0, sizeof(dtv));
+		/*
+		 * size of dtv is SZ*2
+		 */
+		rz_io_nread_at(core->io, addr + (SZ * 2), dtv, sizeof(GHT));
+		addr = GH(read_val)(core, dtv, false);
+		rz_debug_map_sync(core->dbg);
+		for (k = addr; k <= addr + 0x100; k += SZ) {
+			RzDebugMap *map;
+			RzListIter *iter;
+
+			rz_list_foreach (core->dbg->maps, iter, map) {
+				if ( map->size != HEAP_PAGE_SIZE || map->perm != RZ_PERM_RW) {
+					if (strcmp(core->dbg->arch, "x86") || map->size != HEAP_PAGE_SIZE_X86) {
+   						continue;
+					}
+				}
+
+				rz_io_nread_at(core->io, k, tcache_addr, sizeof(GHT));
+				GHT tcache_guess = GH(read_val)(core, tcache_addr, false);
+				if (tcache_guess < map->addr || tcache_guess > map->addr_end) {
+					continue;
+				}
+
+				tcache_heap = GH(tcache_new)(core);
+				if (!GH(tcache_read)(core, tcache_guess, tcache_heap)) {
+					GH(tcache_free)(tcache_heap);
+					tcache_heap = NULL;
+				}
+				break;
+			}
+			if (tcache_heap != NULL) {
+				RzList* bins = GH(fill_tcache_entries)(core, tcache_heap);
+
+				GH(print_tcache)(core, bins, NULL, tid++);
+				GH(tcache_free)(tcache_heap);
+				tcache_heap = NULL;
+				break;
+			}
+		}
+
 	}
-	free(main_arena);
+
 	return RZ_CMD_STATUS_OK;
 }
 
