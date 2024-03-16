@@ -935,6 +935,21 @@ static void GH(resolve_tcache_perthread)(RZ_NONNULL RzCore *core) {
 			}
 		}
 	}
+}
+
+RZ_API RZ_OWN bool GH(resolve_heap_tcache)(RZ_NONNULL RzCore *core, GHT arena_base) {
+	RzDebug *dbg = core->dbg;
+
+	if (dbg->threads) {
+		GH(resolve_tcache_perthread)
+		(core);
+		return true;
+	}
+
+	// Only main thread is present
+	RzList *bins = GH(rz_heap_tcache_content)(core, arena_base);
+	GH(print_tcache)
+	(core, bins, NULL, 0);
 
 	return false;
 }
