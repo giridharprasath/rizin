@@ -935,6 +935,8 @@ static void GH(resolve_tcache_perthread)(RZ_NONNULL RzCore *core) {
 			}
 		}
 	}
+
+	return false;
 }
 
 RZ_API RZ_OWN bool GH(resolve_heap_tcache)(RZ_NONNULL RzCore *core, GHT arena_base) {
