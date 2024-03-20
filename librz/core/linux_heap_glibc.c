@@ -169,7 +169,7 @@ static ut8 *GH(get_glibc_banner)(RzCore *core, const char *section_name,
 		if (strncmp(rz_section->name, section_name, strlen(section_name))) {
 			continue;
 		}
-		buf = calloc(rz_section->size + 1, 1);
+		buf = calloc(rz_section->size, 1);
 		GHT read_size = rz_buf_read_at(libc_buf->buf, rz_section->paddr, buf, rz_section->size);
 		if (read_size != rz_section->size) {
 			free(buf);
